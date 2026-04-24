@@ -118,6 +118,25 @@ export class BalanceService {
     return ageMs / 60_000 > thresholdMinutes;
   }
 
+  /** Upsert a single balance row from an externally-fetched HCM value. */
+  async upsertBalance(
+    employeeId: string,
+    locationId: string,
+    leaveType: string,
+    hcmBalance: number,
+  ): Promise<void> {
+    const existing = await this.balanceRepo.findByDimension(employeeId, locationId, leaveType);
+    await this.balanceRepo.upsert({
+      id: existing?.id ?? uuidv4(),
+      employeeId,
+      locationId,
+      leaveType: leaveType as LeaveType,
+      hcmBalance,
+      lastSyncedAt: new Date().toISOString(),
+      version: (existing?.version ?? 0) + 1,
+    });
+  }
+
   async refreshActivePendingBalances(): Promise<void> {
     // Called by the cron job to refresh balances for employees with pending requests
     const rows: { employee_id: string; location_id: string }[] = await this.dataSource.query(
