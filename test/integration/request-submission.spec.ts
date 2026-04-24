@@ -2,7 +2,7 @@ import { INestApplication } from '@nestjs/common';
 import { MockHcmServer } from '../mock-hcm/server';
 
 describe('POST /api/v1/time-off/requests — Request Submission', () => {
-  let app: INestApplication;
+  let app: INestApplication | undefined;
   let mockHcm: MockHcmServer;
 
   beforeAll(async () => {

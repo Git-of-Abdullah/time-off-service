@@ -1,7 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 
 describe('POST /api/v1/hcm/batch-sync — Batch Sync', () => {
-  let app: INestApplication;
+  let app: INestApplication | undefined;
 
   beforeAll(async () => {
     // TODO: bootstrap NestJS test app

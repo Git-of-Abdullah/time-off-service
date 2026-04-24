@@ -4,13 +4,14 @@ import {
   Delete,
   Get,
   Headers,
-  HttpCode,
   HttpStatus,
   Param,
   Patch,
   Post,
   Query,
+  Res,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { TimeOffService } from './time-off.service';
 import { SubmitTimeOffRequestDto } from './dto/submit-time-off-request.dto';
 import { ApproveRequestDto } from './dto/approve-request.dto';
@@ -24,11 +25,13 @@ export class TimeOffController {
   @Post('requests')
   async submit(
     @Body() dto: SubmitTimeOffRequestDto,
+    @Res({ passthrough: true }) res: Response,
     @Headers('idempotency-key') headerKey?: string,
   ) {
     const idempotencyKey = headerKey ?? this.timeOffService.deriveIdempotencyKey(dto);
     const result = await this.timeOffService.submit(dto, idempotencyKey);
-    return { statusCode: result.created ? HttpStatus.CREATED : HttpStatus.OK, ...result.request };
+    res.status(result.created ? HttpStatus.CREATED : HttpStatus.OK);
+    return result.request;
   }
 
   @Get('requests')
@@ -42,19 +45,16 @@ export class TimeOffController {
   }
 
   @Patch('requests/:id/approve')
-  @HttpCode(HttpStatus.OK)
   approve(@Param('id') id: string, @Body() dto: ApproveRequestDto) {
     return this.timeOffService.approve(id, dto);
   }
 
   @Patch('requests/:id/reject')
-  @HttpCode(HttpStatus.OK)
   reject(@Param('id') id: string, @Body() dto: RejectRequestDto) {
     return this.timeOffService.reject(id, dto);
   }
 
   @Delete('requests/:id')
-  @HttpCode(HttpStatus.OK)
   cancel(
     @Param('id') id: string,
     @Body('employeeId') employeeId: string,
