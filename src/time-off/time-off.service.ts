@@ -1,8 +1,10 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { createHash } from 'crypto';
@@ -43,13 +45,22 @@ export class TimeOffService {
   // ── submit ─────────────────────────────────────────────────────────────────
 
   async submit(dto: SubmitTimeOffRequestDto, idempotencyKey: string): Promise<SubmitResult> {
-    // Non-concurrent idempotency fast-path
+    // Fast-path idempotency: return existing record without re-validating
     const existing = await this.requestRepo.findByIdempotencyKey(idempotencyKey);
     if (existing) return { request: existing, created: false };
 
+    // Past date guard
+    const today = new Date().toISOString().slice(0, 10);
+    if (dto.startDate < today) {
+      throw new BadRequestException({
+        error: 'DATE_IN_PAST',
+        message: 'startDate cannot be in the past.',
+      });
+    }
+
     const daysRequested = Math.round(dto.daysRequested * 2) / 2;
 
-    // Soft overlap check (outside transaction — acceptable pre-flight)
+    // Overlap check (soft — outside transaction, still fast-fails the obvious case)
     const overlap = await this.requestRepo.findOverlapping(
       dto.employeeId,
       dto.locationId,
@@ -62,6 +73,56 @@ export class TimeOffService {
         error: 'OVERLAPPING_REQUEST',
         message: 'An active request already exists for this date range.',
         conflictingRequestId: overlap.id,
+      });
+    }
+
+    // Compute local pending days (needed after the HCM call to derive real available balance)
+    const localResult = await this.balanceService.computeAvailable(
+      dto.employeeId,
+      dto.locationId,
+      dto.leaveType,
+    );
+    // pendingDays = hcmBalance − available (both values came from the same local snapshot)
+    const pendingDays = localResult
+      ? localResult.balance.hcmBalance - localResult.available
+      : 0;
+
+    // Mandatory HCM GET balance call on every submit — prevents accepting requests against a stale cache
+    let hcmBalance: number;
+    try {
+      const hcmData = await this.hcmClient.getBalance(
+        dto.employeeId,
+        dto.locationId,
+        dto.leaveType,
+      );
+      hcmBalance = hcmData.balance;
+      // Refresh local cache so future reads reflect the latest HCM value
+      await this.balanceService.upsertBalance(
+        dto.employeeId,
+        dto.locationId,
+        dto.leaveType,
+        hcmBalance,
+      );
+    } catch {
+      // HCM unreachable after all retries — do NOT persist the request (TRD §9)
+      throw new ServiceUnavailableException({
+        error: 'HCM_UNAVAILABLE',
+        message: 'HCM is currently unavailable. Please try again later.',
+      });
+    }
+
+    // Real available = fresh HCM balance − local pending requests (ExampleHR owns pending days)
+    const realAvailable = hcmBalance - pendingDays;
+    if (realAvailable < daysRequested - EPSILON) {
+      // Distinguish: local pre-flight also insufficient → INSUFFICIENT_BALANCE
+      //              local looked OK but HCM has less → HCM_BALANCE_MISMATCH (stale cache discovered)
+      const wasLocalInsufficient =
+        localResult !== null && localResult.available < daysRequested - EPSILON;
+      throw new UnprocessableEntityException({
+        error: wasLocalInsufficient ? 'INSUFFICIENT_BALANCE' : 'HCM_BALANCE_MISMATCH',
+        message: 'Insufficient leave balance.',
+        available: realAvailable,
+        requested: daysRequested,
       });
     }
 
@@ -81,21 +142,19 @@ export class TimeOffService {
     request.hcmCommitted = 0;
     request.retryCount = 0;
 
-    // Balance check + save inside a serialized transaction.
-    // This is the concurrency guard: two simultaneous requests both read pending days,
-    // but only one can commit; the second sees the first's days in the re-read and gets 422.
+    // Balance re-check + save inside a serialized transaction.
+    // Closes the concurrent-submission race window: the second request re-reads pending days
+    // AFTER the first has committed, sees the correct (reduced) available balance, and rolls back.
     try {
       await this.requestRepo.getDataSource().transaction(async (manager) => {
-        const balanceRow = await manager
-          .getRepository(LeaveBalance)
-          .findOneBy({
-            employeeId: dto.employeeId,
-            locationId: dto.locationId,
-            leaveType: dto.leaveType,
-          });
+        const balanceRow = await manager.getRepository(LeaveBalance).findOneBy({
+          employeeId: dto.employeeId,
+          locationId: dto.locationId,
+          leaveType: dto.leaveType,
+        });
 
         if (balanceRow) {
-          const { total: pendingDays } = (await manager
+          const { total: freshPending } = (await manager
             .getRepository(TimeOffRequest)
             .createQueryBuilder('r')
             .select('COALESCE(SUM(r.daysRequested), 0)', 'total')
@@ -105,23 +164,20 @@ export class TimeOffService {
             .andWhere("r.status IN ('PENDING', 'HCM_DEDUCT_PENDING')")
             .getRawOne()) as { total: number };
 
-          const available = balanceRow.hcmBalance - pendingDays;
-          if (available < daysRequested - EPSILON) {
+          const freshAvailable = balanceRow.hcmBalance - freshPending;
+          if (freshAvailable < daysRequested - EPSILON) {
             throw new UnprocessableEntityException({
               error: 'INSUFFICIENT_BALANCE',
               message: 'Insufficient leave balance.',
-              available,
+              available: freshAvailable,
               requested: daysRequested,
             });
           }
         }
-        // First-time employee: no balance row → skip check, allow submission
 
         await manager.save(TimeOffRequest, request);
       });
     } catch (err) {
-      // Two identical requests raced past the fast-path idempotency check and hit
-      // the UNIQUE constraint on idempotency_key. Return the winner's row.
       if (isUniqueConstraintError(err)) {
         const winner = await this.requestRepo.findByIdempotencyKey(idempotencyKey);
         if (winner) return { request: winner, created: false };
@@ -151,8 +207,6 @@ export class TimeOffService {
 
     // Re-verify balance and reserve inside a serialized transaction.
     // Excludes the current request from the pending sum (its days are being consumed).
-    // Commits HCM_DEDUCT_PENDING before releasing the write lock so no concurrent
-    // approval can double-count these days.
     await this.requestRepo.getDataSource().transaction(async (manager) => {
       const { total: otherPendingDays } = (await manager
         .getRepository(TimeOffRequest)
@@ -187,7 +241,7 @@ export class TimeOffService {
       await manager.save(TimeOffRequest, request);
     });
 
-    // HCM call outside the transaction — write lock already released
+    // HCM deduct outside the lock
     try {
       const result = await this.hcmClient.deductBalance(
         request.employeeId,
@@ -206,7 +260,7 @@ export class TimeOffService {
         request.status = RequestStatus.PENDING;
         await this.requestRepo.save(request);
         throw new UnprocessableEntityException({
-          error: 'INSUFFICIENT_BALANCE',
+          error: 'HCM_BALANCE_MISMATCH',
           message: 'HCM reported insufficient balance.',
         });
       }
@@ -216,10 +270,13 @@ export class TimeOffService {
         request.managerNotes =
           (request.managerNotes ? request.managerNotes + ' | ' : '') + 'HCM rejected: bad request';
         await this.requestRepo.save(request);
-        throw new UnprocessableEntityException({ error: 'HCM_REJECTED', message: 'HCM rejected the deduction.' });
+        throw new UnprocessableEntityException({
+          error: 'HCM_REJECTED',
+          message: 'HCM rejected the deduction.',
+        });
       }
 
-      // Retryable HCM failure — leave as HCM_DEDUCT_PENDING for cron retry
+      // HCM unavailable — leave as HCM_DEDUCT_PENDING, cron will retry
       this.logger.warn(`HCM deduct failed for request ${id}, will retry via cron`);
     }
 
@@ -249,34 +306,41 @@ export class TimeOffService {
   // ── cancel ─────────────────────────────────────────────────────────────────
 
   async cancel(id: string, requestingEmployeeId: string): Promise<TimeOffRequest> {
-    // IDOR pre-check (outside transaction — lightweight ownership verification)
     const precheck = await this.requestRepo.findById(id);
     if (!precheck || precheck.employeeId !== requestingEmployeeId) {
       throw new NotFoundException({ error: 'REQUEST_NOT_FOUND', message: 'Request not found.' });
     }
 
-    // Re-read status inside a transaction to guard against concurrent approve+cancel.
-    // Without this, both operations read PENDING, approve commits APPROVED, then
-    // cancel's save overwrites it with CANCELLED — wrong winner.
     let result!: TimeOffRequest;
     let needsHcmCredit = false;
 
+    // Re-read status inside a transaction to guard against concurrent approve+cancel.
     await this.requestRepo.getDataSource().transaction(async (manager) => {
       const fresh = await manager.getRepository(TimeOffRequest).findOneBy({ id });
       if (!fresh || fresh.employeeId !== requestingEmployeeId) {
         throw new NotFoundException({ error: 'REQUEST_NOT_FOUND', message: 'Request not found.' });
       }
-      if (fresh.status !== RequestStatus.PENDING && fresh.status !== RequestStatus.APPROVED) {
+
+      const cancellable = [
+        RequestStatus.PENDING,
+        RequestStatus.APPROVED,
+        RequestStatus.HCM_DEDUCT_PENDING, // cancel locally; nothing was deducted from HCM yet
+      ];
+
+      if (!cancellable.includes(fresh.status)) {
         throw new ConflictException({
           error: 'INVALID_STATUS_TRANSITION',
           message: `Cannot cancel a request in status ${fresh.status}.`,
         });
       }
 
-      if (fresh.status === RequestStatus.PENDING) {
+      if (
+        fresh.status === RequestStatus.PENDING ||
+        fresh.status === RequestStatus.HCM_DEDUCT_PENDING
+      ) {
         fresh.status = RequestStatus.CANCELLED;
       } else {
-        // Stage as CANCELLATION_CREDIT_PENDING; HCM credit attempted below outside the lock
+        // APPROVED — stage as CANCELLATION_CREDIT_PENDING until HCM confirms the reversal
         needsHcmCredit = fresh.hcmCommitted === 1;
         fresh.status = RequestStatus.CANCELLATION_CREDIT_PENDING;
       }
@@ -297,7 +361,6 @@ export class TimeOffService {
         result.status = RequestStatus.CANCELLED;
         result = await this.requestRepo.save(result);
       } catch {
-        // Leave as CANCELLATION_CREDIT_PENDING — cron will retry
         this.logger.warn(`HCM credit failed for request ${id}, will retry via cron`);
       }
     }
