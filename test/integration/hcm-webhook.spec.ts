@@ -8,7 +8,7 @@ function signPayload(body: string): string {
 }
 
 describe('POST /api/v1/hcm/balance-update — Real-Time Webhook', () => {
-  let app: INestApplication;
+  let app: INestApplication | undefined;
 
   beforeAll(async () => {
     // TODO: bootstrap NestJS test app with HCM_WEBHOOK_SECRET=test-hmac-secret

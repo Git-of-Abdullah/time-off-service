@@ -2,7 +2,7 @@ import { INestApplication } from '@nestjs/common';
 import { MockHcmServer } from '../mock-hcm/server';
 
 describe('Background Retry Job — HCM_DEDUCT_PENDING / CANCELLATION_CREDIT_PENDING', () => {
-  let app: INestApplication;
+  let app: INestApplication | undefined;
   let mockHcm: MockHcmServer;
 
   beforeAll(async () => {

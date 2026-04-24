@@ -2,7 +2,7 @@ import { INestApplication } from '@nestjs/common';
 import { MockHcmServer } from '../mock-hcm/server';
 
 describe('GET /api/v1/time-off/balances/:employeeId/:locationId', () => {
-  let app: INestApplication;
+  let app: INestApplication | undefined;
   let mockHcm: MockHcmServer;
 
   beforeAll(async () => {
