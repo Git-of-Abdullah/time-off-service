@@ -45,8 +45,16 @@ export class TimeOffController {
   }
 
   @Patch('requests/:id/approve')
-  approve(@Param('id') id: string, @Body() dto: ApproveRequestDto) {
-    return this.timeOffService.approve(id, dto);
+  async approve(
+    @Param('id') id: string,
+    @Body() dto: ApproveRequestDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const request = await this.timeOffService.approve(id, dto);
+    res.status(
+      request.status === 'HCM_DEDUCT_PENDING' ? HttpStatus.ACCEPTED : HttpStatus.OK,
+    );
+    return request;
   }
 
   @Patch('requests/:id/reject')
@@ -55,10 +63,15 @@ export class TimeOffController {
   }
 
   @Delete('requests/:id')
-  cancel(
+  async cancel(
     @Param('id') id: string,
     @Body('employeeId') employeeId: string,
+    @Res({ passthrough: true }) res: Response,
   ) {
-    return this.timeOffService.cancel(id, employeeId);
+    const request = await this.timeOffService.cancel(id, employeeId);
+    res.status(
+      request.status === 'CANCELLATION_CREDIT_PENDING' ? HttpStatus.ACCEPTED : HttpStatus.OK,
+    );
+    return request;
   }
 }

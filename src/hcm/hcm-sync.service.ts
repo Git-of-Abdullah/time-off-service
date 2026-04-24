@@ -263,6 +263,18 @@ export class HcmSyncService {
       );
       request.status = RequestStatus.CANCELLED;
       this.logger.log(`Request ${request.id} cancelled via retry credit`);
+      // Refresh local balance so the restored days are visible immediately
+      try {
+        const hcm = await this.hcmClient.getBalance(request.employeeId, request.locationId, request.leaveType);
+        await this.balanceService.syncFromHcm({
+          employeeId: request.employeeId,
+          locationId: request.locationId,
+          leaveType: request.leaveType,
+        });
+        void hcm; // balance will be pulled by syncFromHcm
+      } catch (e) {
+        this.logger.warn(`Balance refresh after credit failed for ${request.id}: ${e}`);
+      }
     } catch (err) {
       request.retryCount++;
       this.logger.warn(`Request ${request.id} credit retry failed (attempt ${request.retryCount}/${MAX_RETRY_COUNT})`);
@@ -307,7 +319,11 @@ export class HcmSyncService {
   private deduplicateRecords(records: BatchSyncRecordDto[]): BatchSyncRecordDto[] {
     const seen = new Map<string, BatchSyncRecordDto>();
     for (const r of records) {
-      seen.set(`${r.employeeId}::${r.locationId}::${r.leaveType}`, r);
+      const key = `${r.employeeId}::${r.locationId}::${r.leaveType}`;
+      if (seen.has(key)) {
+        this.logger.warn(`HCM_BATCH_DUPLICATE_RECORD: ${key} — keeping last occurrence`);
+      }
+      seen.set(key, r);
     }
     return Array.from(seen.values());
   }

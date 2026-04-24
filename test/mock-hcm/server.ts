@@ -1,5 +1,8 @@
-import express, { Application } from 'express';
+import * as express from 'express';
+import { Application } from 'express';
 import { Server } from 'http';
+import { createHmac } from 'crypto';
+import axios from 'axios';
 import { createInitialState, MockHcmState, makeBalanceKey } from './state';
 import { handleGetBalance, handleDeductBalance, handleCreditBalance } from './handlers';
 import { buildControlRouter } from './control.routes';
@@ -68,5 +71,41 @@ export class MockHcmServer {
 
   getBalance(employeeId: string, locationId: string, leaveType: string): number | undefined {
     return this.state.balances.get(makeBalanceKey(employeeId, locationId, leaveType))?.balance;
+  }
+
+  /**
+   * Sends a signed HCM balance-update webhook to the NestJS app.
+   * Callers provide the app's base URL and the HMAC secret configured for that test run.
+   */
+  async triggerBalanceChange(opts: {
+    appBaseUrl: string;
+    secret: string;
+    employeeId: string;
+    locationId: string;
+    leaveType: string;
+    newBalance: number;
+    eventId?: string;
+    effectiveAt?: string;
+  }): Promise<void> {
+    const body = JSON.stringify({
+      eventId: opts.eventId ?? `evt_${Date.now()}`,
+      timestamp: Math.floor(Date.now() / 1000),
+      eventType: 'BALANCE_UPDATE',
+      employeeId: opts.employeeId,
+      locationId: opts.locationId,
+      leaveType: opts.leaveType,
+      newBalance: opts.newBalance,
+      reason: 'TEST_TRIGGER',
+      effectiveAt: opts.effectiveAt ?? new Date().toISOString(),
+    });
+
+    const signature = createHmac('sha256', opts.secret).update(body).digest('hex');
+
+    await axios.post(`${opts.appBaseUrl}/hcm/balance-update`, body, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hcm-signature': signature,
+      },
+    });
   }
 }
