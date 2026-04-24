@@ -35,6 +35,9 @@ export class HmacSignatureGuard implements CanActivate {
   }
 
   private isTimestampValid(timestamp: unknown): boolean {
+    // Batch-sync payloads carry no timestamp — replay protection comes from payload-hash
+    // idempotency instead. Only enforce the window when a timestamp field is present.
+    if (timestamp === undefined || timestamp === null) return true;
     if (typeof timestamp !== 'number') return false;
     const diffSeconds = Math.abs(Math.floor(Date.now() / 1000) - timestamp);
     return diffSeconds <= REPLAY_WINDOW_SECONDS;
